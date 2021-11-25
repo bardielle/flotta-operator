@@ -316,19 +316,26 @@ func (h *Handler) toWorkloadList(logger logr.Logger, deployments []v1alpha1.Edge
 		if deployment.DeletionTimestamp != nil {
 			continue
 		}
-		podSpec, err := yaml.Marshal(deployment.Spec.Pod.Spec)
+		spec := deployment.Spec
+		podSpec, err := yaml.Marshal(spec.Pod.Spec)
 		if err != nil {
 			logger.Error(err, "cannot marshal pod specification", "deployment name", deployment.Name)
 			continue
 		}
 		var data *models.DataConfiguration
-		if deployment.Spec.Data != nil && len(deployment.Spec.Data.Paths) > 0 {
+		if spec.Data != nil && len(spec.Data.Paths) > 0 {
 			var paths []*models.DataPath
-			for _, path := range deployment.Spec.Data.Paths {
+			for _, path := range spec.Data.Paths {
 				paths = append(paths, &models.DataPath{Source: path.Source, Target: path.Target})
 			}
 			data = &models.DataConfiguration{Paths: paths}
 		}
+		if spec.ImageRepositories != nil {
+			if secretRef := spec.ImageRepositories.AuthFileSecret; secretRef != nil {
+
+			}
+		}
+
 		workload := models.Workload{
 			Name:          deployment.Name,
 			Specification: string(podSpec),
