@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -31,22 +32,37 @@ import (
 	"github.com/jakub-dzon/k4e-operator/internal/yggdrasil"
 	"github.com/jakub-dzon/k4e-operator/restapi"
 	"github.com/kelseyhightower/envconfig"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	monclientv1 "github.com/coreos/prometheus-operator/pkg/client/versioned/typed/monitoring/v1"
 	managementv1alpha1 "github.com/jakub-dzon/k4e-operator/api/v1alpha1"
 	"github.com/jakub-dzon/k4e-operator/controllers"
 	obv1 "github.com/kube-object-storage/lib-bucket-provisioner/pkg/apis/objectbucket.io/v1alpha1"
+	"github.com/operator-framework/operator-sdk/pkg/k8sutil"
+	"github.com/operator-framework/operator-sdk/pkg/metrics"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	//+kubebuilder:scaffold:imports
+)
+
+// Change below variables to serve metrics on different host or port.
+var (
+	metricsHost             = "0.0.0.0"
+	metricsPort       int32 = 8383
+	customMetricsPath       = "/metrics"
 )
 
 const (
@@ -153,6 +169,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Add the Metrics Service
+	ctx := context.TODO()
+	cfg, err := config.GetConfig()
+	if err := addMetrics(ctx, cfg); err != nil {
+		setupLog.Error(err, "Metrics service is not added.")
+		os.Exit(1)
+	}
+
 	go func() {
 		h, err := restapi.Handler(restapi.Config{
 			YggdrasilAPI: yggdrasil.NewYggdrasilHandler(edgeDeviceRepository, edgeDeploymentRepository, claimer, initialDeviceNamespace, mgr.GetEventRecorderFor("edgedeployment-controller")),
@@ -170,4 +194,55 @@ func main() {
 		os.Exit(1)
 	}
 
+}
+
+// addMetrics will create the Services and Service Monitors to allow the operator export the metrics by using
+// the Prometheus operator
+func addMetrics(ctx context.Context, cfg *rest.Config) error {
+	// Get the namespace the operator is currently deployed in.
+	operatorNs, err := k8sutil.GetOperatorNamespace()
+	if err != nil {
+		if errors.Is(err, k8sutil.ErrRunLocal) {
+			setupLog.Info("Skipping CR metrics server creation; not running in a cluster.")
+			return nil
+		}
+	}
+
+	// Add to the below struct any other metrics ports you want to expose.
+	servicePorts := []v1.ServicePort{
+		{Port: metricsPort, Name: metrics.OperatorPortName, Protocol: v1.ProtocolTCP, TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: metricsPort}},
+	}
+
+	// Create Service object to expose the metrics port(s).
+	service, err := metrics.CreateMetricsService(ctx, cfg, servicePorts)
+	if err != nil {
+		setupLog.Info("Could not create metrics Service", "error", err.Error())
+	}
+
+	services := []*v1.Service{service}
+	mclient := monclientv1.NewForConfigOrDie(cfg)
+	copts := metav1.CreateOptions{}
+
+	for _, s := range services {
+		if s == nil {
+			continue
+		}
+
+		sm := metrics.GenerateServiceMonitor(s)
+
+		// ErrSMMetricsExists is used to detect if the -metrics ServiceMonitor already exists
+		var ErrSMMetricsExists = fmt.Sprintf("servicemonitors.monitoring.coreos.com \"%s-metrics\" already exists", "k4e-Operator")
+
+		setupLog.Info(fmt.Sprintf("Attempting to create service monitor %s", sm.Name))
+		// TODO: Get SM and compare to see if an UPDATE is required
+		_, err := mclient.ServiceMonitors(operatorNs).Create(ctx, sm, copts)
+		if err != nil {
+			if err.Error() != ErrSMMetricsExists {
+				return err
+			}
+			setupLog.Info("ServiceMonitor already exists")
+		}
+		setupLog.Info(fmt.Sprintf("Successfully configured service monitor %s", sm.Name))
+	}
+	return nil
 }
